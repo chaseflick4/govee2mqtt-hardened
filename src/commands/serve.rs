@@ -12,16 +12,28 @@ use anyhow::Context;
 use chrono::Utc;
 use once_cell::sync::Lazy;
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::time::{sleep, Duration};
 
 pub static POLL_INTERVAL: Lazy<chrono::Duration> = Lazy::new(|| chrono::Duration::seconds(900));
 
+fn parse_loopback_socket(value: &str) -> Result<SocketAddr, String> {
+    let address: SocketAddr = value
+        .parse()
+        .map_err(|error| format!("invalid socket address: {error}"))?;
+    if !address.ip().is_loopback() {
+        return Err("HTTP API may only bind to a loopback address".to_string());
+    }
+    Ok(address)
+}
+
 #[derive(clap::Parser, Debug)]
 pub struct ServeCommand {
-    /// The port on which the HTTP API will listen
-    #[arg(long, default_value_t = 8056)]
-    http_port: u16,
+    /// Explicitly enable the unauthenticated HTTP API on a loopback socket.
+    /// The API is disabled by default because Home Assistant uses MQTT.
+    #[arg(long, value_name = "IP:PORT", value_parser = parse_loopback_socket)]
+    http_bind: Option<SocketAddr>,
 }
 
 async fn poll_single_device(state: &StateHandle, device: &Device) -> anyhow::Result<()> {
@@ -350,8 +362,47 @@ impl ServeCommand {
         // start advertising on local mqtt
         spawn_hass_integration(state.clone(), &args.hass_args).await?;
 
-        run_http_server(state.clone(), self.http_port)
-            .await
-            .with_context(|| format!("Starting HTTP service on port {}", self.http_port))
+        if let Some(http_bind) = self.http_bind {
+            run_http_server(state.clone(), http_bind)
+                .await
+                .with_context(|| format!("Starting HTTP service on {http_bind}"))
+        } else {
+            log::info!("HTTP API disabled; Home Assistant control is available through MQTT");
+            std::future::pending::<anyhow::Result<()>>().await
+        }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use clap::Parser;
+
+    #[test]
+    fn http_service_is_disabled_by_default() {
+        let args = crate::Args::try_parse_from(["govee", "serve"]).unwrap();
+        let crate::SubCommand::Serve(command) = args.cmd else {
+            panic!("expected serve command");
+        };
+
+        assert_eq!(command.http_bind, None);
+    }
+
+    #[test]
+    fn http_service_accepts_an_explicit_loopback_socket() {
+        let args = crate::Args::try_parse_from(["govee", "serve", "--http-bind", "127.0.0.1:8056"])
+            .unwrap();
+        let crate::SubCommand::Serve(command) = args.cmd else {
+            panic!("expected serve command");
+        };
+
+        assert_eq!(command.http_bind.unwrap().to_string(), "127.0.0.1:8056");
+    }
+
+    #[test]
+    fn http_service_rejects_non_loopback_bind_addresses() {
+        let error = crate::Args::try_parse_from(["govee", "serve", "--http-bind", "0.0.0.0:8056"])
+            .unwrap_err();
+
+        assert!(error.to_string().contains("may only bind to a loopback"));
     }
 }

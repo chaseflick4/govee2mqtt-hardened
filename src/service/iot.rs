@@ -8,8 +8,22 @@ use anyhow::Context;
 use async_channel::Receiver;
 use mosquitto_rs::{Event, QoS};
 use serde::Deserialize;
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::time::Duration;
 use tokio::time::timeout;
+
+fn write_private_key(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .mode(0o600)
+        .open(path)?;
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    file.write_all(contents)
+}
 
 #[derive(Clone)]
 pub struct IotClient {
@@ -250,7 +264,7 @@ pub async fn start_iot_client(
         let pem = priv_key
             .private_key_to_pem_pkcs8()
             .context("to_pem_pkcs8")?;
-        std::fs::write(&args.govee_iot_key, &pem)?;
+        write_private_key(&args.govee_iot_key, &pem)?;
     }
     for cert in container.cert_bags(&res.p12_pass).context("cert_bags")? {
         let cert = openssl::x509::X509::from_der(&cert).context("x509 from der")?;
@@ -303,6 +317,29 @@ pub async fn start_iot_client(
     });
 
     Ok(())
+}
+
+#[cfg(test)]
+mod security_test {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn private_key_writer_enforces_owner_only_permissions() {
+        let path = std::env::temp_dir().join(format!(
+            "govee2mqtt-private-key-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(&path, b"old-key").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        write_private_key(&path, b"new-key").unwrap();
+
+        let metadata = std::fs::metadata(&path).unwrap();
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        assert_eq!(std::fs::read(&path).unwrap(), b"new-key");
+        std::fs::remove_file(path).unwrap();
+    }
 }
 
 #[derive(Deserialize, Debug)]

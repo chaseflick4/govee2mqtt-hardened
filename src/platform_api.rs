@@ -969,20 +969,12 @@ pub struct ArrayOption {
 }
 
 pub fn from_json<T: serde::de::DeserializeOwned, S: AsRef<[u8]>>(text: S) -> anyhow::Result<T> {
-    let text = text.as_ref();
-    serde_json_path_to_error::from_slice(text).map_err(|err| {
-        anyhow::anyhow!(
-            "{} {err}. Input: {}",
-            std::any::type_name::<T>(),
-            String::from_utf8_lossy(text)
-        )
-    })
+    serde_json_path_to_error::from_slice(text.as_ref())
+        .map_err(|err| anyhow::anyhow!("{} {err}", std::any::type_name::<T>()))
 }
 
 #[derive(Deserialize, Debug)]
 struct EmbeddedRequestStatus {
-    #[serde(alias = "msg")]
-    message: String,
     #[serde(alias = "code")]
     status: u16,
 }
@@ -1016,19 +1008,15 @@ pub async fn json_body<T: serde::de::DeserializeOwned>(
                 return Err(HttpRequestFailed {
                     status: code,
                     content: format!(
-                        "Request to {url} failed with code {code} {message}. Full response: {}",
-                        String::from_utf8_lossy(&data),
-                        message = status.message
+                        "Request to {url} failed with code {code}; response body omitted"
                     ),
                 })
                 .with_context(|| format!("parsing {url} response"));
             }
 
             anyhow::bail!(
-                "Request to {url} failed with status={status} {message}. Full response was: {}",
-                String::from_utf8_lossy(&data),
-                status = status.status,
-                message = status.message,
+                "Request to {url} failed with status={}; response body omitted",
+                status.status,
             );
         }
     }
@@ -1043,7 +1031,7 @@ pub async fn http_response_body<R: serde::de::DeserializeOwned>(
 
     let status = response.status();
     if !status.is_success() {
-        let body_bytes = response.bytes().await.with_context(|| {
+        response.bytes().await.with_context(|| {
             format!(
                 "request {url} status {}: {}, and failed to read response body",
                 status.as_u16(),
@@ -1052,10 +1040,9 @@ pub async fn http_response_body<R: serde::de::DeserializeOwned>(
         })?;
 
         anyhow::bail!(
-            "request {url} status {}: {}. Response body: {}",
+            "request {url} status {}: {}. Response body omitted",
             status.as_u16(),
-            status.canonical_reason().unwrap_or(""),
-            String::from_utf8_lossy(&body_bytes)
+            status.canonical_reason().unwrap_or("")
         );
     }
     json_body(response).await.with_context(|| {
@@ -1109,8 +1096,73 @@ impl GoveeApiClient {
 #[cfg(test)]
 mod test {
     use super::*;
+    use std::io::{Read, Write};
 
     const SCENE_LIST: &str = include_str!("../test-data/scenes.json");
+
+    #[derive(Debug, Deserialize)]
+    struct SecretBearingResponse {
+        #[serde(rename = "required")]
+        _required: String,
+    }
+
+    async fn response_with_body(status_line: &str, response_body: String) -> reqwest::Response {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let status_line = status_line.to_string();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 1024];
+            let bytes_read = stream.read(&mut request).unwrap();
+            assert!(bytes_read > 0);
+            write!(
+                stream,
+                "HTTP/1.1 {status_line}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            )
+            .unwrap();
+        });
+
+        reqwest::get(format!("http://{address}/secret"))
+            .await
+            .unwrap()
+    }
+
+    #[test]
+    fn json_parse_errors_never_echo_response_bodies() {
+        let sentinel = "DO-NOT-LOG-BEARER-TOKEN";
+        let body = format!(r#"{{"token":"{sentinel}"}}"#);
+        let error = from_json::<SecretBearingResponse, _>(body).unwrap_err();
+        let message = format!("{error:#}");
+
+        assert!(!message.contains(sentinel));
+        assert!(!message.contains("\"token\""));
+    }
+
+    #[tokio::test]
+    async fn http_errors_never_echo_response_bodies() {
+        let sentinel = "DO-NOT-LOG-REFRESH-TOKEN";
+        let response_body = format!(r#"{{"refreshToken":"{sentinel}"}}"#);
+        let response = response_with_body("401 Unauthorized", response_body).await;
+        let error = http_response_body::<JsonValue>(response).await.unwrap_err();
+        let message = format!("{error:#}");
+
+        assert!(!message.contains(sentinel));
+        assert!(!message.contains("refreshToken"));
+    }
+
+    #[tokio::test]
+    async fn embedded_api_errors_never_echo_response_messages() {
+        let sentinel = "DO-NOT-LOG-ACCOUNT-DETAIL";
+        let response_body = format!(r#"{{"code":401,"message":"{sentinel}"}}"#);
+        let response = response_with_body("200 OK", response_body).await;
+        let error = json_body::<JsonValue>(response).await.unwrap_err();
+        let message = format!("{error:#}");
+
+        assert!(!message.contains(sentinel));
+        assert!(message.contains("response body omitted"));
+    }
 
     #[test]
     fn get_device_scenes() {

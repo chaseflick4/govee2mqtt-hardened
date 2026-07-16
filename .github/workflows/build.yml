@@ -21,7 +21,7 @@ on:
       - ".dockerignore"
 
 env:
-  IMAGE: ghcr.io/wez/govee2mqtt
+  IMAGE: ghcr.io/chaseflick4/govee2mqtt-hardened
 
 jobs:
   build:
@@ -164,6 +164,8 @@ jobs:
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Apply tag to version
+        env:
+          TAG_NAME: ${{ github.ref_name }}
         run: ./scripts/apply-tag.sh
       - name: Build and Publish Home Assistant Add On
         uses: home-assistant/builder@2026.02.1
@@ -171,7 +173,6 @@ jobs:
           args: |
             --amd64 \
             --aarch64 \
-            --cosign \
             --target /data/addon
 
   test-addon:
@@ -210,5 +211,4 @@ jobs:
             --test \
             --amd64 \
             --aarch64 \
-            --cosign \
             --target /data/addon
